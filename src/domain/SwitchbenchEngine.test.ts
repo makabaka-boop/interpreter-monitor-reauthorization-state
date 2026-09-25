@@ -58,14 +58,20 @@ function totalDisconnects(h: ReturnType<typeof harness>): number {
   )
 }
 
-async function authorizeOk(h: ReturnType<typeof harness>): Promise<void> {
+async function authorizeOk(h: {
+  engine: SwitchbenchEngine
+  media: FakeMediaDevices
+}): Promise<void> {
   const p = h.engine.authorize()
   h.media.grantNext() // 探测流
   await p
 }
 
 async function auditionOk(
-  h: ReturnType<typeof harness>,
+  h: {
+    engine: SwitchbenchEngine
+    media: FakeMediaDevices
+  },
   which: Which,
   deviceId: string,
 ): Promise<FakeStream> {
@@ -726,5 +732,185 @@ describe('SwitchbenchEngine — 正常交叉淡化与设备选择兼容', () => 
     expect(h.snap().backup.deviceId).toBe('dev-backup')
     expect(h.snap().canArm).toBe(false)
     expect(h.snap().micActive).toBe(false)
+  })
+})
+
+/**
+ * 确定性验收（彩排缺陷回归）：用可控设备清单 / 轨道 / 音频上下文，
+ * 先试听两路，再依次执行 ① 两路试听中的重复授权、② 设备清单变化、
+ * ③ 逐路改选，逐步核对实际活轨道的设备身份、阶段、占用指示、
+ * 停止与武装入口，以及武装/切换后的耳返实际输出来源。
+ */
+describe('SwitchbenchEngine — 重复授权 / 清单变化 / 逐路改选验收', () => {
+  function harness3() {
+    const media = new FakeMediaDevices([
+      { deviceId: 'dev-primary', label: '主席台麦', kind: 'audioinput' },
+      { deviceId: 'dev-backup', label: '同传箱备麦', kind: 'audioinput' },
+      { deviceId: 'dev-third', label: '三楼旁听麦', kind: 'audioinput' },
+    ])
+    const host = new FakeHost(media)
+    const clock = new ManualScheduler()
+    const engine = new SwitchbenchEngine(host, clock)
+    const snap = (): Snapshot => engine.getSnapshot()
+    const lineDevice = (which: Which): string => {
+      const ch = (engine as unknown as EngineInternals).channels[which]
+      if (!ch.line) throw new Error(`${which} 线路不存在`)
+      return ch.line.tracks[0].getSettings().deviceId ?? ''
+    }
+    const hasLine = (which: Which): boolean =>
+      (engine as unknown as EngineInternals).channels[which].line !== null
+    return { media, host, clock, engine, snap, lineDevice, hasLine }
+  }
+
+  async function auditionBoth(h: ReturnType<typeof harness3>) {
+    const primary = await auditionOk(h, 'primary', 'dev-primary')
+    const backup = await auditionOk(h, 'backup', 'dev-backup')
+    return { primary, backup }
+  }
+
+  it('① 两路试听占用麦克风时重复授权：保持试听态，活轨道身份/占用/停止与武装入口不变', async () => {
+    const h = harness3()
+    await authorizeOk(h)
+    const { primary, backup } = await auditionBoth(h)
+    const genBefore = h.engine.getGeneration()
+
+    // 授权进行中：忙碌但停止入口仍可用（麦克风被在途探测流占用时不能失去停止入口）。
+    const p = h.engine.authorize()
+    await flush()
+    expect(h.snap().busy).toBe(true)
+    expect(h.snap().canStop).toBe(true)
+    h.media.grantNext('reauth-probe')
+    await p
+
+    const s = h.snap()
+    // 阶段不得退回 idle：两条试听轨道仍然存活。
+    expect(s.phase).toBe('audition')
+    expect(s.generation).toBeGreaterThan(genBefore)
+    // 实际活轨道的设备身份未被授权改写，轨道未被停止。
+    expect(h.lineDevice('primary')).toBe('dev-primary')
+    expect(h.lineDevice('backup')).toBe('dev-backup')
+    expect(primary.tracks[0].readyState).toBe('live')
+    expect(backup.tracks[0].readyState).toBe('live')
+    expect(primary.tracks[0].stopCount).toBe(0)
+    expect(backup.tracks[0].stopCount).toBe(0)
+    // 占用指示如实点亮，停止入口保留，武装入口仍可用，试听资格保留。
+    expect(s.micActive).toBe(true)
+    expect(s.canStop).toBe(true)
+    expect(s.canArm).toBe(true)
+    expect(s.primary.auditioned).toBe(true)
+    expect(s.backup.auditioned).toBe(true)
+    expect(s.message).toContain('试听线路继续在线')
+
+    // 停止入口真正可用且能释放全部。
+    h.engine.stop()
+    expect(h.snap().phase).toBe('idle')
+    expect(h.snap().micActive).toBe(false)
+    expect(primary.tracks[0].stopCount).toBe(1)
+    expect(backup.tracks[0].stopCount).toBe(1)
+  })
+
+  it('② 新清单移除原备路设备：旧线路与试听资格释放，改派后所示选择与活轨道来源一致', async () => {
+    const h = harness3()
+    await authorizeOk(h)
+    const { primary, backup } = await auditionBoth(h)
+
+    // 设备热插拔后的清单：备路原设备 dev-backup 已消失，新增 dev-third 仍在。
+    h.media.devices = [
+      { deviceId: 'dev-primary', label: '主席台麦', kind: 'audioinput' },
+      { deviceId: 'dev-third', label: '三楼旁听麦', kind: 'audioinput' },
+    ]
+    const p = h.engine.authorize()
+    h.media.grantNext('reauth-probe')
+    await p
+
+    const s = h.snap()
+    // 主路原设备仍在：活轨道保留，身份不变。
+    expect(h.lineDevice('primary')).toBe('dev-primary')
+    expect(primary.tracks[0].readyState).toBe('live')
+    expect(s.primary.auditioned).toBe(true)
+    // 备路原设备已不在清单：旧轨道必须停止、线路摘除、试听资格清除。
+    expect(backup.tracks[0].stopCount).toBe(1)
+    expect(h.hasLine('backup')).toBe(false)
+    expect(s.backup.status).toBe('idle')
+    expect(s.backup.auditioned).toBe(false)
+    expect(s.backup.deviceId).toBe('dev-third') // 不得再顶着 dev-backup 的名义
+    // 仍有一路活轨道：停留试听态、占用点亮、停止可用，但武装入口必须关闭。
+    expect(s.phase).toBe('audition')
+    expect(s.micActive).toBe(true)
+    expect(s.canStop).toBe(true)
+    expect(s.canArm).toBe(false)
+    expect(s.message).toContain('已不在清单')
+
+    // 对改派后的备路重新试听：所示选择与实际轨道设备身份必须一致。
+    const backup2 = await auditionOk(h, 'backup', 'dev-third')
+    expect(h.lineDevice('primary')).toBe(h.snap().primary.deviceId)
+    expect(h.lineDevice('backup')).toBe('dev-third')
+    expect(h.snap().backup.deviceId).toBe('dev-third')
+    expect(h.snap().canArm).toBe(true)
+
+    // 武装：耳返活动输出为主路，来源就是主路所示设备。
+    h.engine.arm()
+    expect(h.snap().activeWhich).toBe('primary')
+    expect(h.lineDevice('primary')).toBe('dev-primary')
+
+    // 切换：候选来自当前备路选择 dev-third，淡化后实际输出来源与其一致。
+    const sp = h.engine.switchToBackup()
+    await flush()
+    const candidate = h.media.grantNext('candidate') as FakeStream
+    expect(candidate.tracks[0].deviceId).toBe('dev-third')
+    await flush()
+    await flush()
+    await sp
+    h.clock.runFades()
+    expect(h.snap().phase).toBe('live')
+    expect(h.snap().activeWhich).toBe('backup')
+    expect(h.lineDevice('backup')).toBe('dev-third')
+    expect(primary.tracks[0].stopCount).toBe(1)
+    // 旧备路试听线路在淡化后由候选替代并释放，耳返只留候选一路活轨道。
+    expect(backup2.tracks[0].stopCount).toBe(1)
+    expect(candidate.tracks[0].readyState).toBe('live')
+    expect(h.snap().micActive).toBe(true)
+  })
+
+  it('③ 试听阶段逐路改选：旧轨道全停后回到待命态，无"已释放"残留，需重新试听', async () => {
+    const h = harness3()
+    await authorizeOk(h)
+    const { primary, backup } = await auditionBoth(h)
+
+    // 先改选主路：主路旧轨道停止、线路摘除；备路仍活，阶段保持试听。
+    h.engine.selectDevice('primary', 'dev-third')
+    expect(primary.tracks[0].stopCount).toBe(1)
+    expect(h.hasLine('primary')).toBe(false)
+    expect(h.snap().primary.status).toBe('idle')
+    expect(h.snap().primary.auditioned).toBe(false)
+    expect(h.snap().primary.deviceId).toBe('dev-third')
+    expect(h.snap().phase).toBe('audition')
+    expect(h.snap().micActive).toBe(true)
+    expect(h.snap().canStop).toBe(true)
+    expect(backup.tracks[0].readyState).toBe('live')
+
+    // 再改选备路：两路旧轨道均已停止，必须回到待命态而非停留试听态。
+    h.engine.selectDevice('backup', 'dev-primary')
+    expect(backup.tracks[0].stopCount).toBe(1)
+    const s = h.snap()
+    expect(s.phase).toBe('idle')
+    expect(s.micActive).toBe(false)
+    expect(s.canStop).toBe(false) // 无占用即无停止入口（不再被试听态误导）
+    expect(s.canArm).toBe(false)
+    expect(s.primary.status).toBe('idle') // 不得残留 'released' 已释放线路
+    expect(s.backup.status).toBe('idle')
+    expect(s.primary.auditioned).toBe(false)
+    expect(s.backup.auditioned).toBe(false)
+    expect(s.message).toContain('重新试听')
+
+    // 按当前选择重新试听两路后可再次武装，输出来源与所示选择一致。
+    const p2 = await auditionOk(h, 'primary', 'dev-third')
+    const b2 = await auditionOk(h, 'backup', 'dev-primary')
+    expect(h.snap().canArm).toBe(true)
+    h.engine.arm()
+    expect(h.snap().activeWhich).toBe('primary')
+    expect(h.lineDevice('primary')).toBe('dev-third')
+    expect(p2.tracks[0].readyState).toBe('live')
+    expect(b2.tracks[0].readyState).toBe('live')
   })
 })

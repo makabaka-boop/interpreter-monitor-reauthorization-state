@@ -184,19 +184,34 @@ export class SwitchbenchEngine {
         this.devices = listed.filter(
           (d) => d.kind === 'audioinput' && d.deviceId !== '',
         ) as MediaDeviceInfoLike[]
-        this.applyDefaultSelection('primary')
-        this.applyDefaultSelection('backup')
+        // 重新枚举后逐路核对选择：所选设备仍在则保留试听线路与资格；
+        // 已从清单消失的设备必须释放其旧线路、清除试听资格后再改派，
+        // 绝不能让旧设备轨道顶着新选择的名义进入耳返。
+        const staleLabels: string[] = []
+        const releasedPrimary = this.reconcileSelection('primary')
+        if (releasedPrimary) staleLabels.push(releasedPrimary)
+        const releasedBackup = this.reconcileSelection('backup')
+        if (releasedBackup) staleLabels.push(releasedBackup)
 
         // 故障态下重新授权等价于回到可重新试听的起点。
         if (this.phase === 'fault') {
           this.activeWhich = null
-          this.message = ''
         }
-        this.phase = 'idle'
-        this.message =
-          this.devices.length > 0
-            ? `授权成功，发现 ${this.devices.length} 个音频输入设备，请分别选择主、备输入。`
-            : '授权成功，但未枚举到任何音频输入设备。'
+        // 试听中重新授权：仍有活试听线路就留在试听态（保留停止入口），
+        // 不能无条件退回 idle——否则麦克风仍被占用却失去停止入口。
+        const liveMonitors = this.anyLiveMonitor()
+        this.phase = liveMonitors ? 'audition' : 'idle'
+        if (staleLabels.length > 0) {
+          this.message = `授权成功，但原试听设备已不在清单：${staleLabels.join(
+            '、',
+          )} 的试听线路已释放，请对新选择重新试听。`
+        } else if (this.devices.length > 0) {
+          this.message = liveMonitors
+            ? '授权成功，设备清单核对无误，现有试听线路继续在线。'
+            : `授权成功，发现 ${this.devices.length} 个音频输入设备，请分别选择主、备输入。`
+        } else {
+          this.message = '授权成功，但未枚举到任何音频输入设备。'
+        }
         this.publish()
       } catch (error) {
         if (probe) this.discardStream(probe)
@@ -224,12 +239,21 @@ export class SwitchbenchEngine {
       this.publish()
       return
     }
-    if (ch.line) this.releaseLine(ch.line)
+    if (ch.line) {
+      this.releaseLine(ch.line)
+      // 必须摘除引用：releaseLine 只释放节点，不清除通道引用；
+      // 残留的已释放线路会让 anyLiveMonitor() 恒真，阶段永远回不到 idle。
+      ch.line = null
+      ch.level = 0
+    }
     ch.deviceId = device.deviceId
     ch.deviceLabel = device.label || `${LABEL[which]}设备 ${device.deviceId.slice(0, 6) || ''}`
     ch.auditioned = false
     ch.level = 0
-    if (this.phase === 'audition' && !this.anyLiveMonitor()) this.phase = 'idle'
+    if (this.phase === 'audition' && !this.anyLiveMonitor()) {
+      this.phase = 'idle'
+      this.message = `${LABEL[which]}已改选设备，原试听线路已释放，请重新试听。`
+    }
     this.publish()
   }
 
@@ -242,6 +266,7 @@ export class SwitchbenchEngine {
   async audition(which: Which): Promise<void> {
     if (!this.supported) return
     if (this.phase === 'armed' || this.phase === 'switching' || this.phase === 'live') return
+    if (this.isBusy()) return
     const ch = this.channels[which]
     if (ch.requesting) return
     const device = devicesMatch(this.devices, ch.deviceId)
@@ -728,13 +753,30 @@ export class SwitchbenchEngine {
   private lastBackupId = ''
   private lastBackupLabel = ''
 
-  private applyDefaultSelection(which: Which): void {
+  /**
+   * 授权（或重新授权枚举）后核对一路的设备选择：
+   *  - 所选设备仍在清单：保留选择、试听线路与已试听资格，仅同步标签；
+   *  - 所选设备已消失：先释放该路仍存活的旧线路并清除试听资格，
+   *    再按主取第一、备取第二（不足顺延第一）改派现存设备。
+   * 返回因设备消失而被释放线路的原设备标签；未释放返回 null。
+   */
+  private reconcileSelection(which: Which): string | null {
     const ch = this.channels[which]
     const keep = devicesMatch(this.devices, ch.deviceId)
     if (keep) {
       ch.deviceLabel = keep.label
-      return
+      return null
     }
+
+    let releasedLabel: string | null = null
+    if (ch.line) {
+      releasedLabel = ch.deviceLabel
+      this.releaseLine(ch.line)
+      ch.line = null
+      ch.level = 0
+    }
+    ch.auditioned = false
+
     // 主默认第一个，备默认第二个（不足时与主相同，由用户自行改选）。
     const idx = which === 'primary' ? 0 : 1
     const pick = this.devices[idx] ?? this.devices[0]
@@ -752,6 +794,7 @@ export class SwitchbenchEngine {
       this.lastBackupId = ch.deviceId
       this.lastBackupLabel = ch.deviceLabel
     }
+    return releasedLabel
   }
 
   private activeLine(): InternalLine | null {
@@ -762,7 +805,8 @@ export class SwitchbenchEngine {
 
   private anyLiveMonitor(): boolean {
     return (
-      this.channels.primary.line !== null || this.channels.backup.line !== null
+      this.channels.primary.line !== null && !this.channels.primary.line.released ||
+      this.channels.backup.line !== null && !this.channels.backup.line.released
     )
   }
 
