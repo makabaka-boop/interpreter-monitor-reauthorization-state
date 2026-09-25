@@ -184,18 +184,30 @@ export class SwitchbenchEngine {
         this.devices = listed.filter(
           (d) => d.kind === 'audioinput' && d.deviceId !== '',
         ) as MediaDeviceInfoLike[]
-        this.applyDefaultSelection('primary')
-        this.applyDefaultSelection('backup')
+        // 让每路的“显示选择 / 活轨道 / 试听资格”与新清单对齐：
+        // 原设备消失的路会被收掉线路并要求重新试听。
+        const resetPrimary = this.reconcileWithDevices('primary')
+        const resetBackup = this.reconcileWithDevices('backup')
 
         // 故障态下重新授权等价于回到可重新试听的起点。
         if (this.phase === 'fault') {
           this.activeWhich = null
-          this.message = ''
         }
-        this.phase = 'idle'
+        // 仍有试听线路在线时必须保持试听态：阶段如实反映麦克风占用，
+        // 停止入口才不会在轨道仍存活时被禁用。
+        this.phase = this.anyLiveMonitor() ? 'audition' : 'idle'
+        const resetNames = [
+          resetPrimary ? LABEL.primary : '',
+          resetBackup ? LABEL.backup : '',
+        ].filter(Boolean)
         this.message =
           this.devices.length > 0
-            ? `授权成功，发现 ${this.devices.length} 个音频输入设备，请分别选择主、备输入。`
+            ? `授权成功，发现 ${this.devices.length} 个音频输入设备。` +
+              (resetNames.length > 0
+                ? `${resetNames.join('、')}原设备已不在清单中，其试听线路已停止，请重新试听。`
+                : this.anyLiveMonitor()
+                  ? '在线试听线路保持不变。'
+                  : '请分别选择主、备输入。')
             : '授权成功，但未枚举到任何音频输入设备。'
         this.publish()
       } catch (error) {
@@ -224,12 +236,22 @@ export class SwitchbenchEngine {
       this.publish()
       return
     }
-    if (ch.line) this.releaseLine(ch.line)
+    const hadState = ch.line !== null || ch.auditioned
+    if (ch.line) {
+      // 改选设备：原试听轨道的来源已不等于新选择，必须停止并释放，
+      // 且清空引用——否则界面会把已释放线路继续显示为本路状态。
+      this.releaseLine(ch.line)
+      ch.line = null
+    }
     ch.deviceId = device.deviceId
     ch.deviceLabel = device.label || `${LABEL[which]}设备 ${device.deviceId.slice(0, 6) || ''}`
     ch.auditioned = false
     ch.level = 0
+    // 两路都没有活线路时回到空闲态：操作员可据状态判断必须重新试听。
     if (this.phase === 'audition' && !this.anyLiveMonitor()) this.phase = 'idle'
+    this.message = hadState
+      ? `已改选${LABEL[which]}为「${ch.deviceLabel}」，原试听线路已停止，请重新试听。`
+      : `已选择${LABEL[which]}：${ch.deviceLabel}。`
     this.publish()
   }
 
@@ -728,6 +750,31 @@ export class SwitchbenchEngine {
   private lastBackupId = ''
   private lastBackupLabel = ''
 
+  /**
+   * 授权刷新设备清单后，让单路的“显示选择 / 活轨道 / 试听资格”保持一致：
+   *  - 原设备仍在清单中：保留选择与线路，仅刷新标签；
+   *  - 原设备已不在清单：该路活轨道的真实来源已不等于任何可展示的选择，
+   *    必须停止并释放、清空试听资格，再落到默认选择，要求重新试听——
+   *    否则武装后耳返的实际来源会与页面所示设备不符。
+   * 返回值：是否确实收掉了该路已建立的线路 / 试听资格（用于提示）。
+   */
+  private reconcileWithDevices(which: Which): boolean {
+    const ch = this.channels[which]
+    if (devicesMatch(this.devices, ch.deviceId)) {
+      this.applyDefaultSelection(which)
+      return false
+    }
+    const hadState = ch.line !== null || ch.auditioned
+    if (ch.line) {
+      this.releaseLine(ch.line)
+      ch.line = null
+    }
+    ch.auditioned = false
+    ch.level = 0
+    this.applyDefaultSelection(which)
+    return hadState
+  }
+
   private applyDefaultSelection(which: Which): void {
     const ch = this.channels[which]
     const keep = devicesMatch(this.devices, ch.deviceId)
@@ -761,9 +808,11 @@ export class SwitchbenchEngine {
   }
 
   private anyLiveMonitor(): boolean {
-    return (
-      this.channels.primary.line !== null || this.channels.backup.line !== null
-    )
+    const live = (w: Which): boolean => {
+      const line = this.channels[w].line
+      return !!line && !line.released
+    }
+    return live('primary') || live('backup')
   }
 
   private isBusy(): boolean {
