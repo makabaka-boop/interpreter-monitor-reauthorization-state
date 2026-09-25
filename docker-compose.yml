@@ -1,0 +1,31 @@
+# 主备话筒切换校验台 —— 纯前端离线容器编排
+#
+# 发布页面（WEB_PORT 可覆盖，默认 8080；容器内固定监听 8080）：
+#   WEB_PORT=9090 docker compose up --build web
+#
+# 一次性验收（构建 + Vitest + Playwright，跑完即退出）：
+#   docker compose --profile verify run --rm verify
+#
+
+services:
+  web:
+    build:
+      context: .
+      target: web
+    image: mic-failover-console:web
+    ports:
+      # 宿主机端口可用环境变量覆盖，容器内始终为 8080。
+      - "${WEB_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  verify:
+    profiles: ["verify"]
+    build:
+      context: .
+      target: verify
+    image: mic-failover-console:verify
+    # 验收为一次性服务：结束后容器退出，不发布端口、不常驻。
+    command:
+      - sh
+      - -c
+      - "npm run build && npm run test && npx playwright test"
